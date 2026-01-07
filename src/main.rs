@@ -1,20 +1,54 @@
 mod runtime;
 mod modules;
 use runtime::JsRuntime;
+use std::time::Duration;
 
-fn main() {
+#[tokio::main]
+async fn main() {
+    println!("=== ToyJS Runtime with Event Loop ===\n");
+
     let mut runtime = JsRuntime::new();
-    let code = r#"
-        import {sum} from './math.js';
+    let event_loop = runtime.run_event_loop();
 
-        print("Hello from JS Module!");
-        let value = add(10, 20);
-        print("10 + 20 = " + value);
-        print(`Using imported sum: 20 + 22 = ${sum(20, 22)}`);
-
-        export default "Finished"
+    println!("--- Test 1: setTimeout ---");
+    let timer_code = r#"
+        print("Setting timeout for 1000ms...");
+        setTimeout(() => {
+            print("Timer fired!");
+        }, 1000);
+        print("Timer scheduled");
     "#;
-    println!("Running JS...");
-    let result = runtime.execute_script_module(code);
-    println!("Result: {}", result);
+    runtime.execute_script_module(timer_code);
+
+    for _ in 0..20 {
+        runtime.process_callbacks();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    println!("\n--- Test 2: Simple fetch ---");
+    let fetch_code = r#"
+        print("Fetching from httpbin.org...");
+
+        fetch("https://httpbin.org/get")
+            .then(response => response.text())
+            .then(body => {
+                print("Fetch successful! Response length: " + body.length);
+            })
+            .catch(err => {
+                print("Fetch error: " + err);
+            });
+
+        print("Fetch initiated, waiting for response...");
+    "#;
+    runtime.execute_script_module(fetch_code);
+
+    for _ in 0..50 {
+        runtime.process_callbacks();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    println!("\n--- Shutting down ---");
+    runtime.shutdown();
+    event_loop.await.unwrap();
+    println!("Done!");
 }

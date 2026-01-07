@@ -1,8 +1,12 @@
 use std::sync::Once;
+use tokio::sync::mpsc;
 use v8;
 use bindings::{print_cb, add_cb};
 
 mod bindings;
+mod timers;
+mod fetch;
+mod event_loop;
 
 static INIT: Once = Once::new();
 
@@ -14,14 +18,39 @@ pub fn init_v8() {
     });
 }
 
+pub type CallbackId = u64;
+
+pub enum SchedulerMessage {
+    ScheduleTimeout(CallbackId, u64),
+    ScheduleInterval(CallbackId, u64),
+    ClearTimer(CallbackId),
+    Fetch(CallbackId, String), // Simple fetch with URL
+    Shutdown,
+}
+
+pub enum CallbackMessage {
+    ExecuteTimeout(CallbackId),
+    ExecuteInterval(CallbackId),
+    FetchSuccess(CallbackId, String), // Returns body as string
+    FetchError(CallbackId, String),
+}
+
 pub struct JsRuntime {
     isolate: v8::OwnedIsolate,
     context: v8::Global<v8::Context>,
+    scheduler_tx: mpsc::UnboundedSender<SchedulerMessage>,
+    scheduler_rx: Option<mpsc::UnboundedReceiver<SchedulerMessage>>,
+    callback_tx: Option<mpsc::UnboundedSender<CallbackMessage>>,
+    callback_rx: mpsc::UnboundedReceiver<CallbackMessage>,
 }
 
 impl JsRuntime {
     pub fn new() -> Self {
         init_v8();
+
+        let (scheduler_tx, scheduler_rx) = mpsc::unbounded_channel();
+        let (callback_tx, callback_rx) = mpsc::unbounded_channel();
+
         let params = v8::CreateParams::default();
         let mut isolate = v8::Isolate::new(params);
         isolate.set_host_import_module_dynamically_callback(bindings::host_import_module_dynamically_callback);
@@ -34,13 +63,22 @@ impl JsRuntime {
             let scope = &mut v8::ContextScope::new(&mut scope, context);
             Self::setup_bindings(scope);
 
+            timers::setup_timers(scope, scheduler_tx.clone());
+            fetch::setup_fetch(scope, scheduler_tx.clone());
+
             v8::Global::new(scope, context)
         };
 
-        // Initialize global module loader
         let _ = crate::modules::FsModuleLoader::global();
 
-        Self { isolate, context }
+        Self {
+            isolate,
+            context,
+            scheduler_tx,
+            scheduler_rx: Some(scheduler_rx),
+            callback_tx: Some(callback_tx),
+            callback_rx,
+        }
     }
 
     fn setup_bindings(scope: &mut v8::PinScope) {
@@ -58,6 +96,7 @@ impl JsRuntime {
         global.set(scope, name.into(), func.into());
     }
 
+    // This is faster to run one off scripts without any imports. Cannot use fetch bindings either.
     pub fn execute_script(&mut self, code: &str) -> String {
         let handle_scope = std::pin::pin!(v8::HandleScope::new(&mut self.isolate));
         let scope = &mut handle_scope.init();
@@ -78,6 +117,7 @@ impl JsRuntime {
         let result = result.to_string(scope).unwrap();
         result.to_rust_string_lossy(scope)
     }
+
     fn module_resolver<'a>(
         context: v8::Local<'a, v8::Context>,
         specifier: v8::Local<'a, v8::String>,
@@ -247,6 +287,90 @@ impl JsRuntime {
 
         let result = result.to_string(tc_scope).unwrap();
         result.to_rust_string_lossy(tc_scope)
+    }
+
+    pub fn process_callbacks(&mut self) {
+        let scope = std::pin::pin!(v8::HandleScope::new(&mut self.isolate));
+        let mut scope = scope.init();
+        let context = v8::Local::new(&scope, &self.context);
+        let scope = &mut v8::ContextScope::new(&mut scope, context);
+
+        while let Ok(msg) = self.callback_rx.try_recv() {
+            match msg {
+                CallbackMessage::ExecuteTimeout(id) | CallbackMessage::ExecuteInterval(id) => {
+                    println!("Executing timer callback: id={}", id);
+                    // Call JavaScript __executeTimer(id)
+                    let global = context.global(scope);
+                    let execute_timer_key = v8::String::new(scope, "__executeTimer").unwrap();
+
+                    if let Some(execute_fn_val) = global.get(scope, execute_timer_key.into()) {
+                        if execute_fn_val.is_function() {
+                            let execute_fn: v8::Local<v8::Function> =
+                                execute_fn_val.try_into().unwrap();
+                            let id_val = v8::Number::new(scope, id as f64);
+                            execute_fn.call(scope, global.into(), &[id_val.into()]);
+                        }
+                    }
+                }
+                CallbackMessage::FetchSuccess(id, body) => {
+                    println!("Executing fetch success callback: id={}", id);
+                    let global = context.global(scope);
+                    let execute_fn_key = v8::String::new(scope, "__executeFetchSuccess").unwrap();
+
+                    if let Some(execute_fn_val) = global.get(scope, execute_fn_key.into()) {
+                        if execute_fn_val.is_function() {
+                            let execute_fn: v8::Local<v8::Function> =
+                                execute_fn_val.try_into().unwrap();
+                            let id_val = v8::Number::new(scope, id as f64);
+                            let body_val = v8::String::new(scope, &body).unwrap();
+                            execute_fn.call(scope, global.into(), &[id_val.into(), body_val.into()]);
+                        }
+                    }
+                }
+                CallbackMessage::FetchError(id, error) => {
+                    println!("Executing fetch error callback: id={}, error={}", id, error);
+                    let global = context.global(scope);
+                    let execute_fn_key = v8::String::new(scope, "__executeFetchError").unwrap();
+
+                    if let Some(execute_fn_val) = global.get(scope, execute_fn_key.into()) {
+                        if execute_fn_val.is_function() {
+                            let execute_fn: v8::Local<v8::Function> =
+                                execute_fn_val.try_into().unwrap();
+                            let id_val = v8::Number::new(scope, id as f64);
+                            let error_val = v8::String::new(scope, &error).unwrap();
+                            execute_fn.call(scope, global.into(), &[id_val.into(), error_val.into()]);
+                        }
+                    }
+                }
+            }
+        }
+
+        let tc_scope = std::pin::pin!(v8::TryCatch::new(scope));
+        let mut tc_scope = tc_scope.init();
+        tc_scope.perform_microtask_checkpoint();
+
+        if let Some(exception) = tc_scope.exception() {
+            let exception_string = exception
+                .to_string(&tc_scope)
+                .map(|s| s.to_rust_string_lossy(&*tc_scope))
+                .unwrap_or_else(|| "Unknown exception".to_string());
+            eprintln!("Exception during microtask processing: {}", exception_string);
+        }
+    }
+
+    pub fn run_event_loop(&mut self) -> tokio::task::JoinHandle<()> {
+        let scheduler_rx = self.scheduler_rx.take()
+            .expect("Event loop can only be started once");
+        let callback_tx = self.callback_tx.take()
+            .expect("Event loop can only be started once");
+
+        tokio::spawn(async move {
+            event_loop::run_event_loop(scheduler_rx, callback_tx).await;
+        })
+    }
+
+    pub fn shutdown(&self) {
+        let _ = self.scheduler_tx.send(SchedulerMessage::Shutdown);
     }
 }
 
