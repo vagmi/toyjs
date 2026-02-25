@@ -13,3 +13,10 @@ ToyJS is a minimal JavaScript runtime built with Rust and V8. It serves as an ed
   - `setTimeout` / `setInterval`: Timer operations.
   - `fetch`: Basic HTTP requests (returns a Promise).
 - **Event Loop**: Custom implementation using `tokio` to handle asynchronous tasks.
+
+
+## Test it
+
+```sh
+$ cargo run exec -- js/index.js
+```
