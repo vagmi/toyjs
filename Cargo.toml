@@ -11,6 +11,10 @@ path = "src/simple.rs"
 name = "addfn"
 path = "src/add.rs"
 
+[[bin]]
+name = "exec"
+path = "src/exec.rs"
+
 [dependencies]
 v8 = "142.2.0"
 tokio = { version = "1.43", features = ["full"] }

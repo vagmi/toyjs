@@ -1,6 +1,4 @@
-mod runtime;
-mod modules;
-use runtime::JsRuntime;
+use toyjs::runtime::JsRuntime;
 use std::time::Duration;
 
 #[tokio::main]

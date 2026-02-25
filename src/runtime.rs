@@ -206,6 +206,16 @@ impl JsRuntime {
     }
 
     pub fn execute_script_module(&mut self, code: &str) -> String {
+        self.execute_module_inner(code, "main.js")
+    }
+
+    pub fn execute_module(&mut self, path: &std::path::Path) -> anyhow::Result<String> {
+        let code = std::fs::read_to_string(path)?;
+        let path_str = path.to_str().unwrap_or("main.js");
+        Ok(self.execute_module_inner(&code, path_str))
+    }
+
+    fn execute_module_inner(&mut self, code: &str, filename: &str) -> String {
         let handle_scope = std::pin::pin!(v8::HandleScope::new(&mut self.isolate));
         let scope = &mut handle_scope.init();
         let context = v8::Local::new(scope, &self.context);
@@ -216,7 +226,7 @@ impl JsRuntime {
         let source_str = v8::String::new(tc_scope, code).unwrap();
         let origin = v8::ScriptOrigin::new(
             tc_scope,
-            v8::String::new(tc_scope, "main.js").unwrap().into(),
+            v8::String::new(tc_scope, filename).unwrap().into(),
             0,
             0,
             false,
@@ -229,7 +239,7 @@ impl JsRuntime {
         );
         let mut source = v8::script_compiler::Source::new(source_str, Some(&origin));
 
-        println!("Compiling module...");
+        println!("Compiling module {}...", filename);
         let module = match v8::script_compiler::compile_module(tc_scope, &mut source) {
             Some(module) => {
                 println!("Module compiled successfully");
@@ -247,10 +257,21 @@ impl JsRuntime {
         {
             let loader = crate::modules::FsModuleLoader::global();
             let mut loader_guard = loader.lock().unwrap();
-            // Use the current directory as the base path for the main module
-            let cwd = std::env::current_dir().unwrap().to_string_lossy().to_string();
-            let main_path = format!("{}/main.js", cwd);
-            loader_guard.store_module(main_path, global_module, module_hash);
+            
+            let full_path = if std::path::Path::new(filename).is_absolute() {
+                filename.to_string()
+            } else {
+                let cwd = std::env::current_dir().unwrap().to_string_lossy().to_string();
+                format!("{}/{}", cwd, filename)
+            };
+            
+            // Canonicalize the path if possible
+            let stored_path = match std::path::Path::new(&full_path).canonicalize() {
+                Ok(p) => p.to_string_lossy().to_string(),
+                Err(_) => full_path,
+            };
+
+            loader_guard.store_module(stored_path, global_module, module_hash);
         }
 
         println!("Instantiating module...");
