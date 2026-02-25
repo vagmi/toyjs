@@ -3,6 +3,14 @@ name = "toyjs"
 version = "0.1.0"
 edition = "2024"
 
+[[bin]]
+name = "simple"
+path = "src/simple.rs"
+
+[[bin]]
+name = "addfn"
+path = "src/add.rs"
+
 [dependencies]
 v8 = "142.2.0"
 tokio = { version = "1.43", features = ["full"] }
