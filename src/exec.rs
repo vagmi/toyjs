@@ -37,7 +37,7 @@ async fn main() -> anyhow::Result<()> {
     // For this toy runtime, we'll just poll for a bit
     for _ in 0..50 {
         runtime.process_callbacks();
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
     }
 
     runtime.shutdown();
